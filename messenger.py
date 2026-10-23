@@ -93,12 +93,17 @@ class MessengerClient:
         return header, ciphertext
 
     def receiveMessage(self, name, header, ciphertext):
-        if len(header) != 73:
+        # Reject non-bytes inputs, incorrect header length, or truncated ciphertexts
+        if not isinstance(header, (bytes, bytearray)) or len(header) != 73:
+            return None
+        if not isinstance(ciphertext, (bytes, bytearray)) or len(ciphertext) < 12:
             return None
 
         if name in self.conns:
             state = self.conns[name]
         else:
+            if name not in self.certs:
+                return None
             state = {
                 "RK": self.dh_sk.exchange(ec.ECDH(), self.certs[name]),
                 "DHs": self.dh_sk,
@@ -112,52 +117,54 @@ class MessengerClient:
         PN = int.from_bytes(header[65:69], "big")
         msg_num = int.from_bytes(header[69:73], "big")
 
-        known_pk = None
+        try:
+            known_pk = None
+            if state["DHr"] is not None:
+                known_pk = state["DHr"].public_bytes(
+                    serialization.Encoding.X962,
+                    serialization.PublicFormat.UncompressedPoint
+                )
 
-        if state["DHr"] is not None:
-            known_pk = state["DHr"].public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+            if header_pk != known_pk:
+                if state["CKr"] is not None and PN != state["Nr"]:
+                    return None
 
-        if header_pk != known_pk:
-            if state["CKr"] is not None and PN != state["Nr"]:
+                new_remote = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), header_pk)
+                dh_out = state["DHs"].exchange(ec.ECDH(), new_remote)
+                out = HKDF(algorithm=hashes.SHA256(), length=64, salt=state["RK"], info=b"ratchet").derive(dh_out)
+                state["RK"], state["CKr"] = out[:32], out[32:]
+                state["DHr"] = new_remote
+                state["Nr"] = 0
+
+                state["PN"] = state["Ns"]
+                state["Ns"] = 0
+                new_sk = ec.generate_private_key(ec.SECP256R1())
+                dh_out = new_sk.exchange(ec.ECDH(), state["DHr"])
+                out = HKDF(algorithm=hashes.SHA256(), length=64, salt=state["RK"], info=b"ratchet").derive(dh_out)
+                state["RK"], state["CKs"] = out[:32], out[32:]
+                state["DHs"] = new_sk
+
+            if state["CKr"] is None or msg_num != state["Nr"]:
                 return None
 
-            new_remote = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), header_pk)
-            dh_out = state["DHs"].exchange(ec.ECDH(), new_remote)
-            out = HKDF(algorithm=hashes.SHA256(), length=64, salt=state["RK"], info=b"ratchet").derive(dh_out)
-            state["RK"], state["CKr"] = out[:32], out[32:]
-            state["DHr"] = new_remote
-            state["Nr"] = 0
+            h = hmac.HMAC(state["CKr"], hashes.SHA256())
+            h.update(b"\x01")
+            msg_key = h.finalize()
 
-            state["PN"] = state["Ns"]
-            state["Ns"] = 0
-            new_sk = ec.generate_private_key(ec.SECP256R1())
-            dh_out = new_sk.exchange(ec.ECDH(), state["DHr"])
-            out = HKDF(algorithm=hashes.SHA256(), length=64, salt=state["RK"], info=b"ratchet").derive(dh_out)
-            state["RK"], state["CKs"] = out[:32], out[32:]
-            state["DHs"] = new_sk
+            h = hmac.HMAC(state["CKr"], hashes.SHA256())
+            h.update(b"\x02")
+            state["CKr"] = h.finalize()
 
-        if state["CKr"] is None or msg_num != state["Nr"]:
-            return None
+            nonce = ciphertext[:12]
+            body = ciphertext[12:]
 
-        h = hmac.HMAC(state["CKr"], hashes.SHA256())
-        h.update(b"\x01")
-        msg_key = h.finalize()
-
-        h = hmac.HMAC(state["CKr"], hashes.SHA256())
-        h.update(b"\x02")
-        state["CKr"] = h.finalize()
-
-        nonce = ciphertext[:12]
-        body = ciphertext[12:]
-
-        try:
             message = AESGCM(msg_key).decrypt(nonce, body, header)
-        except InvalidTag:
-            return None
+            state["Nr"] += 1
+            self.conns[name] = state
+            return message.decode("utf-8")
 
-        state["Nr"] += 1
-        self.conns[name] = state
-        return message.decode()
+        except (InvalidTag, TypeError, ValueError, UnicodeDecodeError):
+            return None
 
     def report(self, name, message):
         plaintext = "User: " + name + "\nMessage: " + message
